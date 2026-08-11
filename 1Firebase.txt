@@ -1,0 +1,25 @@
+// Function to upload sensor readings to Firebase
+void uploadSensorReadings(double DateTime ,float latitude, float longitude, float accZ, long Duration, long Distance) {
+  // Create a DynamicJsonDocument
+  DynamicJsonDocument jsonPayload(256);
+
+  // Fill in the sensor data
+  jsonPayload["Detection DateTime"] = DateTime;
+  jsonPayload["Detection Latitude"] = latitude;
+  jsonPayload["Detection Longitude"] = longitude;
+  jsonPayload["Detection Acceleration"] = accZ;
+  jsonPayload["Anomaly Duration"] = Duration;
+  jsonPayload["Anomaly Distance"] = Distance;
+
+  // Serialize the JSON document to a String
+  String jsonString;
+  serializeJson(jsonPayload, jsonString);
+  
+  // Upload the data to Firebase
+  if (Firebase.pushString(firebaseData, "/Detection_Calculated_Readings", jsonPayload)) {
+    Serial.println("Sensor readings uploaded to Firebase successfully.");
+  } else {
+    Serial.println("Failed to upload sensor readings to Firebase.");
+    Serial.println("Reason: " + firebaseData.errorReason());
+  }
+}

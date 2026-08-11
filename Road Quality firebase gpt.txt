@@ -1,0 +1,58 @@
+#include <ESP8266WiFi.h>
+#include <FirebaseESP8266.h>
+
+// Replace with your network credentials
+const char* ssid = "your_SSID";
+const char* password = "your_PASSWORD";
+
+// Replace with your Firebase project URL
+#define FIREBASE_HOST "your_project_url.firebaseio.com"
+// Replace with your Firebase secret key
+#define FIREBASE_SECRET "your_secret_key"
+// Replace with your Firebase authentication type
+#define FIREBASE_AUTH "your_authentication_type"
+
+// Initialize Firebase
+FirebaseData firebaseData;
+FirebaseAuth auth;
+FirebaseConfig firebaseConfig;
+
+void setup() {
+  // Start serial communication
+  Serial.begin(9600);
+
+  // Connect to Wi-Fi
+  WiFi.begin(ssid, password);
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(1000);
+    Serial.println("Connecting to WiFi...");
+  }
+  Serial.println("Connected to WiFi");
+
+  // Initialize Firebase
+  firebaseConfig.host = FIREBASE_HOST;
+  firebaseConfig.auth_type = FIREBASE_AUTH;
+  firebaseConfig.api_key = FIREBASE_SECRET;
+  Firebase.begin(firebaseConfig);
+  auth.loginFirebase();
+
+  // Print a message indicating that the setup is complete
+  Serial.println("Setup complete");
+}
+
+void loop() {
+  // Get the data from Firebase
+  Firebase.getString(firebaseData, "/data");
+
+  // Check if there was an error retrieving the data
+  if (firebaseData.dataType() == "null") {
+    Serial.println("Error retrieving data from Firebase");
+  }
+  else {
+    // Print the data to the serial monitor
+    Serial.println(firebaseData.stringData());
+  }
+
+  // Wait for a few seconds before getting the next data point
+  delay(5000);
+}

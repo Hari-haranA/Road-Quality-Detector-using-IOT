@@ -1,0 +1,610 @@
+//#include <FirebaseJson.h>
+#include <NMEAGPS.h>
+#include <TinyGPS++.h>
+#include <MPU6050.h> //raw data
+#include <MPU6050_tockn.h> //customized
+#include <FirebaseESP8266.h>
+//#include <FirebaseArduino.h>
+#include <ArduinoJson.h>
+#include <ESP8266WiFi.h>
+#include <WiFiClient.h>
+#include <ESP8266HTTPClient.h>
+#include <Wire.h>
+#include <SoftwareSerial.h>
+
+// Define Credentials and Replace with your network credentials
+const char* ssid = "HARI";
+const char* password = "12345678";
+String newname = "Road Quality Detector";
+#define FIREBASE_HOST "road-quality-detector-41ad9-..................basedatabase.app"
+#define FIREBASE_AUTH "kjxzj1YxBzdua.................O3KxJFqpzg"
+#define SOUND_VELOCITY 0.034// per milli second for cm
+#define speedOfSound 34300.0// per second
+#define ROLLING_WINDOW 50
+#define ACCZ_THRESHOLD 0.17 // 0.17G's accleration threshold
+#define carspeed 7 //speed of car is 7km/h
+// Calculate the speed of the car in m/s
+    //float carSpeedkps = (carSpeed * 1000.0) / 3600.0;
+
+// holds the data for each sensor reading that will be stored in EEPROM
+typedef struct {
+    int32_t t;
+    int32_t lat;
+    int32_t lng;
+    float accz;
+    float Latitude, Longitude;
+    //int year , month , date, hour , minute , second;
+} sensorReading_t;
+
+// local variables used for reading data from the MPU6050 and GPS
+// initialize sensors and modules
+NMEAGPS gps;
+SoftwareSerial serialGps(12,13); //gps MODULE TX,RX D6,D7
+MPU6050 mpu6050; // Raw
+MPU6050_TOCKN mpu6050_custom(Wire); //Customized
+FirebaseData firebaseData;
+FirebaseJson json;
+//FirebaseConfig firebaseConfig;
+//WiFiClient wifiClient;
+gps_fix fix;
+sensorReading_t reading;
+
+// Declare pins for components
+uint8_t TRIGGER_PIN = 2 ;  // GPIO for ultrasonic sensor trigger - output D4
+uint8_t ECHO_PIN = 14 ;     // GPIO for ultrasonic sensor echo - input D5
+uint8_t IR_PIN = A0;        // GPIO for IR sensor output  - input A0
+//const int Ao_pin =Ao_pin;     //analog input
+uint8_t BUZZER_PIN = 1 ;    // GPIO for active buzzer signal - output TX
+uint8_t GREEN_PIN = 0;     // GPIO for green light signal - output D3
+uint8_t RED_PIN = 15 ;       // GPIO for red light signal - output D8
+//uint8_t LED_PIN = D0/D4;      // GPIO for onboard LED
+uint8_t SDA_PIN = 4;       // GPIO4 for MPU6050 SDA D2
+uint8_t SCL_PIN = 5;       // GPIO5 for MPU6050 SCL D1
+
+// initialize variables
+int32_t avgAZ;
+uint32_t lastAvgAZ;
+uint32_t avgAZSamples;
+uint16_t numStoredRecords;
+int32_t circleBuf[ROLLING_WINDOW];
+uint32_t circleBufIndex;
+int32_t circleBufSum;
+//bool wifiConnected = false;
+float currentZAxis = 0.0;
+float rollingMean = 0.0;
+float difference = 0.0;
+float detectedAccZ;
+bool anomalyDetected = false;
+bool bumpDetected = false;
+bool detectedBump;
+float IRValue;
+long AnomalyDuration;
+long AnomalyDistance;
+bool irDetected = false;
+
+// Function to upload sensor readings to Firebase
+void uploadSensorReadings(double DateTime ,float latitude, float longitude, float accZ, long Duration, long Distance) {
+  // Prepare the sensor data to be uploaded as a JSON object
+  String jsonPayload = "{";
+  jsonPayload += "\"Detection DateTime\": " + String(DateTime, 12) + ",";
+  jsonPayload += "\"Detection Latitude\": " + String(latitude, 6) + ",";
+  jsonPayload += "\"Detection Longitude\": " + String(longitude, 6) + ",";
+  jsonPayload += "\"Detection Acceleration\": " + String(accZ, 6) + ",";
+  jsonPayload += "\"Anomaly Duration\": " + String(Duration, 6) + ",";
+  jsonPayload += "\"Anomaly Distance\": " + String(Distance, 6);
+  jsonPayload += "}";
+  
+  // Upload the data to Firebase
+  if (Firebase.pushString(firebaseData, "/Detection_Calculated_Readings", jsonPayload)) {
+    Serial.println("Sensor readings uploaded to Firebase successfully.");
+  } else {
+    Serial.println("Failed to upload sensor readings to Firebase.");
+    Serial.println("Reason: " + firebaseData.errorReason());
+  }
+}
+
+void connectToWiFi(){
+// Disable WiFi sleep mode
+ // WiFi.setSleepMode(WIFI_NONE_SLEEP);
+  //bool wifiConnected = false;
+  // Connect to WiFi
+  WiFi.mode(WIFI_STA);
+  WiFi.hostname(newname.c_str());
+  WiFi.begin(ssid, password);
+  while (WiFi.status() != WL_CONNECTED) {
+    // Blink the LED while connecting to WiFi
+    digitalWrite(GREEN_PIN, HIGH);//Turn oN
+    delay(250);
+    digitalWrite(GREEN_PIN, LOW);//Turn oFF
+    delay(250);
+    //delay(1000);
+    Serial.print("Connecting to WiFi...");
+  }
+  Serial.println("Connected to WiFi..!");
+  digitalWrite(GREEN_PIN,HIGH);//always Turn OFF the Led when connected to WiFi
+  tone(BUZZER_PIN, 1000, 200); //sound for wifi 
+  noTone(BUZZER_PIN);
+  Serial.println("IP address: ");
+  Serial.println(WiFi.localIP());
+  //Reconnect Automatically
+  WiFi.setAutoReconnect(true);
+  WiFi.persistent(true);
+  //wifiConnected = true;
+  // Upload data
+  
+}
+
+void setup() {
+  Serial.begin(9600); //Debug Console
+  Serial.println("Road Quality Detector Started....!");
+  // initialize serial communication AND I2C
+  serialGps.begin(9600);
+  Serial.println("GPS Initialized");
+  Wire.begin(SDA_PIN, SCL_PIN);
+ // initialize pins
+  pinMode(TRIGGER_PIN, OUTPUT);
+  pinMode(ECHO_PIN, INPUT);
+  pinMode(IR_PIN, INPUT);
+  pinMode(BUZZER_PIN, OUTPUT);
+  pinMode(GREEN_PIN, OUTPUT);
+  pinMode(RED_PIN, OUTPUT);
+    // initialize MPU6050
+  mpu6050.initialize();
+  mpu6050_custom.begin();
+  connectToWiFi();
+  //initialize Firebase
+  Firebase.begin(FIREBASE_HOST, FIREBASE_AUTH);
+  Serial.println("Firebase Initialized");
+  Serial.println(mpu6050.testConnection() ? "MPU6050 connection successful" : "MPU6050 connection failed");
+  delay(1000);
+}
+
+void loop() {
+  //read gps data
+  while(gps.available(serialGps)) {
+    
+    // Calculate the distance based on the time of car
+             //float distancecm = (pulseDuration / 2.0) * ((speedOfSound + carSpeedkps) / 1000000.0);
+            digitalWrite(TRIGGER_PIN, LOW);
+            long duration2 = pulseIn(ECHO_PIN, HIGH);
+            float distanceCm = (duration2 * SOUND_VELOCITY) / 2;
+   fix = gps.read();
+   Serial.println("GPS is Working...!");
+    double Location_lat = fix.latitudeL();
+    double Location_lon = fix.longitudeL();
+       // read sensor data
+      float ax = mpu6050_custom.getAccX();
+      float ay = mpu6050_custom.getAccY();
+      float az = mpu6050_custom.getAccZ();
+       // calculate Z-axis acceleration
+       currentZAxis = az / 16384.0;
+       Serial.println(currentZAxis);
+       // calculate rolling mean
+       rollingMean = rollingMean * 0.98 + currentZAxis * 0.02;
+       Serial.println(rollingMean);
+       // calculate difference between current value and rolling mean
+      difference = abs(currentZAxis - rollingMean);
+      Serial.println(difference);
+       // check if anomaly is detected and acc threshold is 0.17
+      if (difference > ACCZ_THRESHOLD) { 
+         anomalyDetected = true;
+         Serial.println("Anomaly Detected");
+        // check if bump is detected
+            long duration1, distance1;
+            digitalWrite(TRIGGER_PIN, LOW);
+            delayMicroseconds(2);
+            digitalWrite(TRIGGER_PIN, HIGH);
+            delayMicroseconds(10);
+            digitalWrite(TRIGGER_PIN, LOW);
+            duration1 = pulseIn(ECHO_PIN, HIGH);
+            distance1 = (duration1 * SOUND_VELOCITY) / 2; //calculates in cm  // distanceCm = duration * SOUND_VELOCITY/2; 
+            // Calculate the distance based on the time of car
+             //float distancecm = (pulseDuration / 2.0) * ((speedOfSound + carSpeedkps) / 1000000.0);
+            AnomalyDistance = distance1;
+            AnomalyDuration = duration1;
+            if (distance1 < 3  && distance1 != 0) {
+            bumpDetected = true;
+            Serial.println("Bump or Hole Detected");
+             }    
+        }
+       // check if IR sensor detects sudden motion
+       if (digitalRead(IR_PIN) == HIGH) {
+         float irValue = analogRead(IR_PIN);
+         IRValue = irValue;
+         irDetected = true;
+         tone(BUZZER_PIN, 2000, 300); //play a tone with 1500 Frequency for 0.3 Second
+         digitalWrite(RED_PIN, HIGH);
+         delay(200);
+         digitalWrite(RED_PIN, LOW);
+         delay(200);
+         noTone(BUZZER_PIN);
+         Serial.println("Motion Detected");
+        }
+     // if a bump was detected since the last reading, save the time and location to the EEPROM module
+        if(detectedBump) {
+            reading.t = (time_t)fix.dateTime;
+            reading.Latitude = fix.latitudeL();
+            reading.Longitude = fix.longitudeL();
+            reading.accz = detectedAccZ;
+            // check if bump is detected
+            long duration, distance;
+            digitalWrite(TRIGGER_PIN, LOW);
+            delayMicroseconds(2);
+            digitalWrite(TRIGGER_PIN, HIGH);
+            delayMicroseconds(10);
+            digitalWrite(TRIGGER_PIN, LOW);
+            duration = pulseIn(ECHO_PIN, HIGH);
+            distance = (duration / 2) / 29.1; //mm
+            if (distance < 30 && distance != 0) {
+            bumpDetected = true;
+            Serial.println("Bump or Hole Measured using Raw Acceleration");
+            }
+            Serial.println("Calculated Using RAW Accleration Data");
+            uploadSensorReadings(reading.t,reading.Latitude / 1e7, reading.Longitude / 1e7, reading.accz, duration, distance);
+            // reset detection variables for the rolling mean comparison
+            detectedBump = false;
+            detectedAccZ = 0;
+           // flash the LED to signal a bump was stored  
+         }
+         IPAddress ipAddress(WiFi.localIP());
+         String ipAddressString = ipAddress.toString();
+        // send data to Firebase if Wi-Fi is connected
+       json.add("Automatic Acceleration",currentZAxis);
+       json.add("Rolling_Mean",rollingMean);
+       json.add("Difference",difference);
+       json.add("Anomaly Duration", AnomalyDuration);
+       json.add("Anomaly Distance", AnomalyDistance);
+       json.add("Full time Road to Vehicle Distance", distanceCm);
+       json.add("Automatic Rolling Mean",rollingMean);
+       json.add("Gps Driven Latitude",fix.latitudeL());
+       json.add("Gps Driven Longitude",fix.longitudeL());
+       json.add("Motion Detected",IRValue);
+       json.add("System IP Address",ipAddressString);
+       if (Firebase.pushJSON(firebaseData, "/Automatic_Customized_Sensor_Readings", json)) {
+       Serial.println("Data uploaded to Firebase..!");
+       } else {
+       Serial.println("Data upload failed...");
+       Serial.println(firebaseData.errorReason());
+       }
+     
+    }
+  // add the current acceleration to the total to get an average acceleration every 20ms
+    avgAZ += mpu6050.getAccelerationZ();
+    avgAZSamples++;
+    
+    // use the average acceleration every 20ms
+    if(millis() - lastAvgAZ >= 20) {
+        lastAvgAZ = millis();
+        avgAZ /= avgAZSamples;
+        
+        // if the circle buffer is full, compare the current average acceleration with the current rolling mean of the data
+        if(circleBufIndex >= ROLLING_WINDOW) {
+            float relAmpAccZ = abs(avgAZ * ROLLING_WINDOW - circleBufSum) / 16384.0 / ROLLING_WINDOW;         // computationally cheap way to compute the rolling mean of the acceleration data
+            
+            // if the amplitude of the current acceleration is beyond a threshold away from the rolling mean, a bump was detected 
+            if(relAmpAccZ > ACCZ_THRESHOLD && relAmpAccZ > detectedAccZ) {
+                detectedAccZ = relAmpAccZ;
+                detectedBump = true;
+            } 
+            
+            // subtracts the last element of the circular buffer from the current sum of the data to keep computation speed fast
+            circleBufSum -= circleBuf[circleBufIndex % ROLLING_WINDOW];
+         }
+        
+        // append the average Z axis acceleration to the circle buffer for maintaining a rolling window of the baseline acceleration data
+        circleBuf[circleBufIndex++ % ROLLING_WINDOW] = avgAZ;
+        circleBufSum += avgAZ;
+
+        // reset the average acceleration data for every 20ms
+        avgAZ = 0;
+        avgAZSamples = 0;
+     }
+   delay(500);  //0.5 second
+  
+}
+
+//#include <FirebaseJson.h>
+#include <NMEAGPS.h>
+#include <TinyGPS++.h>
+#include <MPU6050.h> //raw data
+#include <MPU6050_tockn.h> //customized
+#include <FirebaseESP8266.h>
+//#include <FirebaseArduino.h>
+#include <ArduinoJson.h>
+#include <ESP8266WiFi.h>
+#include <WiFiClient.h>
+#include <ESP8266HTTPClient.h>
+#include <Wire.h>
+#include <SoftwareSerial.h>
+
+// Define Credentials and Replace with your network credentials
+const char* ssid = "HARI";
+const char* password = "12345678";
+String newname = "Road Quality Detector";
+#define FIREBASE_HOST "road-quality-detector-41ad9-default-rtdb.asia-southeast1.firebasedatabase.app"
+#define FIREBASE_AUTH "kjxzj1YxBzduaWLaySUfGqssMyTFJ9O3KxJFqpzg"
+#define SOUND_VELOCITY 0.034// per milli second for cm
+#define speedOfSound 34300.0// per second
+#define ROLLING_WINDOW 50
+#define ACCZ_THRESHOLD 0.17 // 0.17G's accleration threshold
+#define carspeed 7 //speed of car is 7km/h
+// Calculate the speed of the car in m/s
+    //float carSpeedkps = (carSpeed * 1000.0) / 3600.0;
+
+// holds the data for each sensor reading that will be stored in EEPROM
+typedef struct {
+    int32_t t;
+    int32_t lat;
+    int32_t lng;
+    float accz;
+    float Latitude, Longitude;
+    //int year , month , date, hour , minute , second;
+} sensorReading_t;
+
+// local variables used for reading data from the MPU6050 and GPS
+// initialize sensors and modules
+NMEAGPS gps;
+SoftwareSerial serialGps(12,13); //gps MODULE TX,RX D6,D7
+MPU6050 mpu6050; // Raw
+MPU6050_TOCKN mpu6050_custom(Wire); //Customized
+FirebaseData firebaseData;
+FirebaseJson json;
+//FirebaseConfig firebaseConfig;
+//WiFiClient wifiClient;
+gps_fix fix;
+sensorReading_t reading;
+
+// Declare pins for components
+uint8_t TRIGGER_PIN = 2 ;  // GPIO for ultrasonic sensor trigger - output D4
+uint8_t ECHO_PIN = 14 ;     // GPIO for ultrasonic sensor echo - input D5
+uint8_t IR_PIN = A0;        // GPIO for IR sensor output  - input A0
+//const int Ao_pin =Ao_pin;     //analog input
+uint8_t BUZZER_PIN = 1 ;    // GPIO for active buzzer signal - output TX
+uint8_t GREEN_PIN = 0;     // GPIO for green light signal - output D3
+uint8_t RED_PIN = 15 ;       // GPIO for red light signal - output D8
+//uint8_t LED_PIN = D0/D4;      // GPIO for onboard LED
+uint8_t SDA_PIN = 4;       // GPIO4 for MPU6050 SDA D2
+uint8_t SCL_PIN = 5;       // GPIO5 for MPU6050 SCL D1
+
+// initialize variables
+int32_t avgAZ;
+uint32_t lastAvgAZ;
+uint32_t avgAZSamples;
+uint16_t numStoredRecords;
+int32_t circleBuf[ROLLING_WINDOW];
+uint32_t circleBufIndex;
+int32_t circleBufSum;
+//bool wifiConnected = false;
+float currentZAxis = 0.0;
+float rollingMean = 0.0;
+float difference = 0.0;
+float detectedAccZ;
+bool anomalyDetected = false;
+bool bumpDetected = false;
+bool detectedBump;
+float IRValue;
+long AnomalyDuration;
+long AnomalyDistance;
+bool irDetected = false;
+
+// Function to upload sensor readings to Firebase
+void uploadSensorReadings(double DateTime ,float latitude, float longitude, float accZ, long Duration, long Distance) {
+  // Prepare the sensor data to be uploaded as a JSON object
+  String jsonPayload = "{";
+  jsonPayload += "\"Detection DateTime\": " + String(DateTime, 12) + ",";
+  jsonPayload += "\"Detection Latitude\": " + String(latitude, 6) + ",";
+  jsonPayload += "\"Detection Longitude\": " + String(longitude, 6) + ",";
+  jsonPayload += "\"Detection Acceleration\": " + String(accZ, 6) + ",";
+  jsonPayload += "\"Anomaly Duration\": " + String(Duration, 6) + ",";
+  jsonPayload += "\"Anomaly Distance\": " + String(Distance, 6);
+  jsonPayload += "}";
+  
+  // Upload the data to Firebase
+  if (Firebase.pushString(firebaseData, "/Detection_Calculated_Readings", jsonPayload)) {
+    Serial.println("Sensor readings uploaded to Firebase successfully.");
+  } else {
+    Serial.println("Failed to upload sensor readings to Firebase.");
+    Serial.println("Reason: " + firebaseData.errorReason());
+  }
+}
+
+void connectToWiFi(){
+// Disable WiFi sleep mode
+ // WiFi.setSleepMode(WIFI_NONE_SLEEP);
+  //bool wifiConnected = false;
+  // Connect to WiFi
+  WiFi.mode(WIFI_STA);
+  WiFi.hostname(newname.c_str());
+  WiFi.begin(ssid, password);
+  while (WiFi.status() != WL_CONNECTED) {
+    // Blink the LED while connecting to WiFi
+    digitalWrite(GREEN_PIN, HIGH);//Turn oN
+    delay(250);
+    digitalWrite(GREEN_PIN, LOW);//Turn oFF
+    delay(250);
+    //delay(1000);
+    Serial.print("Connecting to WiFi...");
+  }
+  Serial.println("Connected to WiFi..!");
+  digitalWrite(GREEN_PIN,HIGH);//always Turn OFF the Led when connected to WiFi
+  tone(BUZZER_PIN, 1000, 200); //sound for wifi 
+  noTone(BUZZER_PIN);
+  Serial.println("IP address: ");
+  Serial.println(WiFi.localIP());
+  //Reconnect Automatically
+  WiFi.setAutoReconnect(true);
+  WiFi.persistent(true);
+  //wifiConnected = true;
+  // Upload data
+  
+}
+
+void setup() {
+  Serial.begin(9600); //Debug Console
+  Serial.println("Road Quality Detector Started....!");
+  // initialize serial communication AND I2C
+  serialGps.begin(9600);
+  Serial.println("GPS Initialized");
+  Wire.begin(SDA_PIN, SCL_PIN);
+ // initialize pins
+  pinMode(TRIGGER_PIN, OUTPUT);
+  pinMode(ECHO_PIN, INPUT);
+  pinMode(IR_PIN, INPUT);
+  pinMode(BUZZER_PIN, OUTPUT);
+  pinMode(GREEN_PIN, OUTPUT);
+  pinMode(RED_PIN, OUTPUT);
+    // initialize MPU6050
+  mpu6050.initialize();
+  mpu6050_custom.begin();
+  connectToWiFi();
+  //initialize Firebase
+  Firebase.begin(FIREBASE_HOST, FIREBASE_AUTH);
+  Serial.println("Firebase Initialized");
+  Serial.println(mpu6050.testConnection() ? "MPU6050 connection successful" : "MPU6050 connection failed");
+  delay(1000);
+}
+
+void loop() {
+  //read gps data
+  while(gps.available(serialGps)) {
+    
+    // Calculate the distance based on the time of car
+             //float distancecm = (pulseDuration / 2.0) * ((speedOfSound + carSpeedkps) / 1000000.0);
+            digitalWrite(TRIGGER_PIN, LOW);
+            long duration2 = pulseIn(ECHO_PIN, HIGH);
+            float distanceCm = (duration2 * SOUND_VELOCITY) / 2;
+   fix = gps.read();
+   Serial.println("GPS is Working...!");
+    double Location_lat = fix.latitudeL();
+    double Location_lon = fix.longitudeL();
+       // read sensor data
+      float ax = mpu6050_custom.getAccX();
+      float ay = mpu6050_custom.getAccY();
+      float az = mpu6050_custom.getAccZ();
+       // calculate Z-axis acceleration
+       currentZAxis = az / 16384.0;
+       Serial.println(currentZAxis);
+       // calculate rolling mean
+       rollingMean = rollingMean * 0.98 + currentZAxis * 0.02;
+       Serial.println(rollingMean);
+       // calculate difference between current value and rolling mean
+      difference = abs(currentZAxis - rollingMean);
+      Serial.println(difference);
+       // check if anomaly is detected and acc threshold is 0.17
+      if (difference > ACCZ_THRESHOLD) { 
+         anomalyDetected = true;
+         Serial.println("Anomaly Detected");
+        // check if bump is detected
+            long duration1, distance1;
+            digitalWrite(TRIGGER_PIN, LOW);
+            delayMicroseconds(2);
+            digitalWrite(TRIGGER_PIN, HIGH);
+            delayMicroseconds(10);
+            digitalWrite(TRIGGER_PIN, LOW);
+            duration1 = pulseIn(ECHO_PIN, HIGH);
+            distance1 = (duration1 * SOUND_VELOCITY) / 2; //calculates in cm  // distanceCm = duration * SOUND_VELOCITY/2; 
+            // Calculate the distance based on the time of car
+             //float distancecm = (pulseDuration / 2.0) * ((speedOfSound + carSpeedkps) / 1000000.0);
+            AnomalyDistance = distance1;
+            AnomalyDuration = duration1;
+            if (distance1 < 3  && distance1 != 0) {
+            bumpDetected = true;
+            Serial.println("Bump or Hole Detected");
+             }    
+        }
+       // check if IR sensor detects sudden motion
+       if (digitalRead(IR_PIN) == HIGH) {
+         float irValue = analogRead(IR_PIN);
+         IRValue = irValue;
+         irDetected = true;
+         tone(BUZZER_PIN, 2000, 300); //play a tone with 1500 Frequency for 0.3 Second
+         digitalWrite(RED_PIN, HIGH);
+         delay(200);
+         digitalWrite(RED_PIN, LOW);
+         delay(200);
+         noTone(BUZZER_PIN);
+         Serial.println("Motion Detected");
+        }
+     // if a bump was detected since the last reading, save the time and location to the EEPROM module
+        if(detectedBump) {
+            reading.t = (time_t)fix.dateTime;
+            reading.Latitude = fix.latitudeL();
+            reading.Longitude = fix.longitudeL();
+            reading.accz = detectedAccZ;
+            // check if bump is detected
+            long duration, distance;
+            digitalWrite(TRIGGER_PIN, LOW);
+            delayMicroseconds(2);
+            digitalWrite(TRIGGER_PIN, HIGH);
+            delayMicroseconds(10);
+            digitalWrite(TRIGGER_PIN, LOW);
+            duration = pulseIn(ECHO_PIN, HIGH);
+            distance = (duration / 2) / 29.1; //mm
+            if (distance < 30 && distance != 0) {
+            bumpDetected = true;
+            Serial.println("Bump or Hole Measured using Raw Acceleration");
+            }
+            Serial.println("Calculated Using RAW Accleration Data");
+            uploadSensorReadings(reading.t,reading.Latitude / 1e7, reading.Longitude / 1e7, reading.accz, duration, distance);
+            // reset detection variables for the rolling mean comparison
+            detectedBump = false;
+            detectedAccZ = 0;
+           // flash the LED to signal a bump was stored  
+         }
+         IPAddress ipAddress(WiFi.localIP());
+         String ipAddressString = ipAddress.toString();
+        // send data to Firebase if Wi-Fi is connected
+       json.add("Automatic Acceleration",currentZAxis);
+       json.add("Rolling_Mean",rollingMean);
+       json.add("Difference",difference);
+       json.add("Anomaly Duration", AnomalyDuration);
+       json.add("Anomaly Distance", AnomalyDistance);
+       json.add("Full time Road to Vehicle Distance", distanceCm);
+       json.add("Automatic Rolling Mean",rollingMean);
+       json.add("Gps Driven Latitude",fix.latitudeL());
+       json.add("Gps Driven Longitude",fix.longitudeL());
+       json.add("Motion Detected",IRValue);
+       json.add("System IP Address",ipAddressString);
+       if (Firebase.pushJSON(firebaseData, "/Automatic_Customized_Sensor_Readings", json)) {
+       Serial.println("Data uploaded to Firebase..!");
+       } else {
+       Serial.println("Data upload failed...");
+       Serial.println(firebaseData.errorReason());
+       }
+     
+    }
+  // add the current acceleration to the total to get an average acceleration every 20ms
+    avgAZ += mpu6050.getAccelerationZ();
+    avgAZSamples++;
+    
+    // use the average acceleration every 20ms
+    if(millis() - lastAvgAZ >= 20) {
+        lastAvgAZ = millis();
+        avgAZ /= avgAZSamples;
+        
+        // if the circle buffer is full, compare the current average acceleration with the current rolling mean of the data
+        if(circleBufIndex >= ROLLING_WINDOW) {
+            float relAmpAccZ = abs(avgAZ * ROLLING_WINDOW - circleBufSum) / 16384.0 / ROLLING_WINDOW;         // computationally cheap way to compute the rolling mean of the acceleration data
+            
+            // if the amplitude of the current acceleration is beyond a threshold away from the rolling mean, a bump was detected 
+            if(relAmpAccZ > ACCZ_THRESHOLD && relAmpAccZ > detectedAccZ) {
+                detectedAccZ = relAmpAccZ;
+                detectedBump = true;
+            } 
+            
+            // subtracts the last element of the circular buffer from the current sum of the data to keep computation speed fast
+            circleBufSum -= circleBuf[circleBufIndex % ROLLING_WINDOW];
+         }
+        
+        // append the average Z axis acceleration to the circle buffer for maintaining a rolling window of the baseline acceleration data
+        circleBuf[circleBufIndex++ % ROLLING_WINDOW] = avgAZ;
+        circleBufSum += avgAZ;
+
+        // reset the average acceleration data for every 20ms
+        avgAZ = 0;
+        avgAZSamples = 0;
+     }
+   delay(500);  //0.5 second
+  
+}
+
